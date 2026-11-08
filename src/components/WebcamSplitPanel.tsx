@@ -120,26 +120,96 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
     }
   };
 
-  const [isSimulationMode, setIsSimulationMode] = useState(false);
-  const simulationIntervalRef = useRef<number | null>(null);
+  // Chargement et initialisation de MediaPipe au montage
+  useEffect(() => {
+    let isMounted = true;
 
-  // Démarrer la webcam et MediaPipe
+    async function initMediaPipe() {
+      try {
+        await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
+        await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
+
+        const HandsConstructor = (window as any).Hands;
+        if (!HandsConstructor) throw new Error('Hands module not loaded');
+
+        const hands = new HandsConstructor({
+          locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+        });
+
+        hands.setOptions({
+          maxNumHands: 2,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.55,
+          minTrackingConfidence: 0.55,
+        });
+
+        hands.onResults((results: MediaPipeResults) => {
+          if (!isMounted) return;
+          // ... [Logique de rendu et poseUpdate inchangée] ...
+          frameCountRef.current++;
+          const now = performance.now();
+          if (now - lastFpsTimeRef.current >= 1000) {
+            setFps(Math.round((frameCountRef.current * 1000) / (now - lastFpsTimeRef.current)));
+            frameCountRef.current = 0;
+            lastFpsTimeRef.current = now;
+          }
+
+          drawOpenCVOverlay(results);
+
+          let leftHand: MediaPipeLandmark[] | null = null;
+          let rightHand: MediaPipeLandmark[] | null = null;
+          const labels: string[] = [];
+
+          if (results.multiHandLandmarks && results.multiHandedness) {
+            setDetectedHandCount(results.multiHandLandmarks.length);
+            results.multiHandedness.forEach((handedness, idx) => {
+              const label = handedness.label;
+              const landmarks = results.multiHandLandmarks?.[idx] as MediaPipeLandmark[] | undefined;
+              if (!landmarks) return;
+              labels.push(label === 'Left' ? 'Main Gauche' : 'Main Droite');
+              if (label === 'Left') leftHand = landmarks;
+              else rightHand = landmarks;
+            });
+            setHandLabels(labels);
+          } else {
+            setDetectedHandCount(0);
+            setHandLabels([]);
+          }
+
+          if (leftHand || rightHand) {
+            const rawPose = buildLiveCameraCharacterPose(leftHand, rightHand);
+            if (isSyncing) onPoseUpdate(rawPose);
+          } else if (isSyncing) {
+            onPoseUpdate(null);
+          }
+        });
+
+        handsInstanceRef.current = hands;
+      } catch (err) {
+        console.error('MediaPipe Init Error:', err);
+      }
+    }
+
+    initMediaPipe();
+
+    return () => {
+      isMounted = false;
+      if (handsInstanceRef.current) {
+        handsInstanceRef.current.close().catch(console.error);
+        handsInstanceRef.current = null;
+      }
+    };
+  }, []);
+
+  // Démarrer la webcam
   const startCamera = useCallback(async () => {
     setCameraError(null);
-    setIsSimulationMode(false);
     try {
-      if (!videoRef.current) return;
-
-      // Charger dynamiquement les scripts MediaPipe CDN pour éviter les erreurs d'export Vite
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
-
-      const HandsConstructor = (window as any).Hands;
       const CameraConstructor = (window as any).Camera;
+      if (!CameraConstructor) throw new Error('Camera module not loaded');
 
-      // Demander l'accès au flux caméra du navigateur
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+        video: true,
         audio: false,
       });
 
@@ -148,79 +218,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         await videoRef.current.play();
       }
 
-      // Initialiser MediaPipe Hands Engine
-      if (!HandsConstructor) {
-        throw new Error('Module MediaPipe Hands non disponible.');
-      }
-
-      const hands = new HandsConstructor({
-        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-      });
-
-      hands.setOptions({
-        maxNumHands: 2,
-        modelComplexity: 1,
-        minDetectionConfidence: 0.55,
-        minTrackingConfidence: 0.55,
-      });
-
-      hands.onResults((results: MediaPipeResults) => {
-        // Mettre à jour le compteur FPS
-        frameCountRef.current++;
-        const now = performance.now();
-        if (now - lastFpsTimeRef.current >= 1000) {
-          setFps(Math.round((frameCountRef.current * 1000) / (now - lastFpsTimeRef.current)));
-          frameCountRef.current = 0;
-          lastFpsTimeRef.current = now;
-        }
-
-        // Rendu sur le Canvas OpenCV
-        drawOpenCVOverlay(results);
-
-        // Extraction des repères gauche et droite
-        let leftHand: MediaPipeLandmark[] | null = null;
-        let rightHand: MediaPipeLandmark[] | null = null;
-        const labels: string[] = [];
-
-        if (results.multiHandLandmarks && results.multiHandedness) {
-          setDetectedHandCount(results.multiHandLandmarks.length);
-
-          results.multiHandedness.forEach((handedness, idx) => {
-            const label = handedness.label; // 'Left' ou 'Right'
-            const landmarks = results.multiHandLandmarks?.[idx] as MediaPipeLandmark[] | undefined;
-            if (!landmarks) return;
-            labels.push(label === 'Left' ? 'Main Gauche' : 'Main Droite');
-
-            if (label === 'Left') {
-              leftHand = landmarks;
-            } else {
-              rightHand = landmarks;
-            }
-          });
-
-          setHandLabels(labels);
-        } else {
-          setDetectedHandCount(0);
-          setHandLabels([]);
-        }
-
-        // Calcul cinématique de pose
-        if (leftHand || rightHand) {
-          const rawPose = buildLiveCameraCharacterPose(leftHand, rightHand);
-          if (isSyncing) {
-            onPoseUpdate(rawPose);
-          }
-        } else {
-          if (isSyncing) {
-            onPoseUpdate(null);
-          }
-        }
-      });
-
-      handsInstanceRef.current = hands;
-
-      // Boucle de capture vidéo avec Camera Utils
-      if (videoRef.current && CameraConstructor) {
+      if (videoRef.current && handsInstanceRef.current) {
         const camera = new CameraConstructor(videoRef.current, {
           onFrame: async () => {
             if (videoRef.current && handsInstanceRef.current) {
@@ -231,84 +229,24 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
           height: 480,
         });
 
-        camera.start();
+        await camera.start();
         cameraInstanceRef.current = camera;
       }
 
       setIsCameraActive(true);
     } catch (err: unknown) {
-      console.error('Erreur accès webcam:', err);
-      const msg = err instanceof Error ? err.message : 'Accès webcam refusé ou non supporté';
+      // ... [Gestion erreur inchangée] ...
+      let msg = 'Accès caméra refusé. Veuillez autoriser la caméra dans les paramètres de votre navigateur.';
+      if (err instanceof Error && (err as any).name === 'NotAllowedError') {
+         msg = 'Accès à la caméra refusé. Cliquez sur l\'icône de caméra dans la barre d\'adresse pour autoriser l\'accès.';
+      } else if (err instanceof Error) {
+         msg = `Erreur caméra : ${err.message}`;
+      }
       setCameraError(msg);
       setIsCameraActive(false);
     }
-  }, [isSyncing, onPoseUpdate]);
+  }, [onPoseUpdate]);
 
-  // Activer le mode simulation / démo si la webcam est refusée
-  const startSimulationMode = useCallback(() => {
-    stopCamera();
-    setCameraError(null);
-    setIsSimulationMode(true);
-    setIsCameraActive(true);
-    setDetectedHandCount(1);
-    setHandLabels(['Main Simulée (Démo)']);
-    setFps(30);
-
-    if (simulationIntervalRef.current) {
-      window.clearInterval(simulationIntervalRef.current);
-    }
-
-    simulationIntervalRef.current = window.setInterval(() => {
-      const time = Date.now() / 400;
-      const fakeLandmarks: MediaPipeLandmark[] = [];
-      for (let i = 0; i < 21; i++) {
-        fakeLandmarks.push({
-          x: 0.5 + 0.18 * Math.sin(time + i * 0.12),
-          y: 0.5 + 0.15 * Math.cos(time * 0.9 + i * 0.15),
-          z: 0.05 * Math.sin(time * 2),
-        });
-      }
-
-      const rawPose = buildLiveCameraCharacterPose(null, fakeLandmarks);
-      if (isSyncing) {
-        onPoseUpdate(rawPose);
-      }
-
-      // Dessiner sur le Canvas de simulation
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.fillStyle = '#0f172a';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-          // Grille de simulation stylisée
-          ctx.strokeStyle = '#1e293b';
-          ctx.lineWidth = 1;
-          for (let x = 0; x < canvas.width; x += 40) {
-            ctx.beginPath();
-            ctx.moveTo(x, 0);
-            ctx.lineTo(x, canvas.height);
-            ctx.stroke();
-          }
-
-          // Dessiner le squelette simulé
-          fakeLandmarks.forEach((pt, pIdx) => {
-            const px = pt.x * canvas.width;
-            const py = pt.y * canvas.height;
-            ctx.beginPath();
-            ctx.arc(px, py, pIdx === 0 ? 8 : 4, 0, Math.PI * 2);
-            ctx.fillStyle = '#38bdf8';
-            ctx.fill();
-          });
-
-          ctx.fillStyle = '#38bdf8';
-          ctx.font = 'bold 12px sans-serif';
-          ctx.fillText('MODE SIMULATION DE DÉMO (WEB-CAM NON REQUISE)', 20, 30);
-        }
-      }
-    }, 33);
-  }, [isSyncing, onPoseUpdate]);
 
   // Arrêter la caméra et détruire les instances
   const stopCamera = useCallback(() => {
@@ -336,11 +274,6 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
       videoRef.current.srcObject = null;
     }
 
-    if (simulationIntervalRef.current) {
-      window.clearInterval(simulationIntervalRef.current);
-      simulationIntervalRef.current = null;
-    }
-    setIsSimulationMode(false);
     setHandLabels([]);
     setFps(0);
     onPoseUpdate(null);
@@ -588,26 +521,28 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         )}
 
         {cameraError && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/95 p-6 text-center space-y-3 z-10">
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/95 p-6 text-center space-y-4 z-10">
             <AlertCircle className="w-10 h-10 text-rose-500" />
-            <p className="text-sm font-bold text-rose-300">Erreur d'accès à la caméra</p>
-            <p className="text-xs text-slate-400 max-w-xs">{cameraError}</p>
-            <div className="flex items-center space-x-2 mt-2">
-              <button
-                type="button"
-                onClick={startCamera}
-                className="px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-white text-xs font-semibold transition-colors"
-              >
-                Réessayer
-              </button>
-              <button
-                type="button"
-                onClick={startSimulationMode}
-                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
-              >
-                Mode Simulation Démo
-              </button>
+            <div className="space-y-1">
+              <p className="text-sm font-bold text-rose-300">Accès à la caméra refusé</p>
+              <div className="text-xs text-slate-400 text-left max-w-xs space-y-2 mt-2">
+                <p>Pour autoriser l'accès :</p>
+                <ol className="list-decimal pl-4 space-y-1">
+                  <li>Cliquez sur l'icône <span className="font-bold text-white">Cadenas</span> ou <span className="font-bold text-white">Caméra</span> dans la barre d'adresse.</li>
+                  <li>Cherchez l'option <span className="font-bold text-white">Caméra</span>.</li>
+                  <li>Passez-la sur <span className="font-bold text-white">Autoriser</span>.</li>
+                  <li><span className="font-bold text-white">Actualisez</span> la page (F5).</li>
+                </ol>
+              </div>
             </div>
+            
+            <button
+              type="button"
+              onClick={startCamera}
+              className="px-4 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 text-white text-xs font-semibold transition-colors"
+            >
+              Réessayer après autorisation
+            </button>
           </div>
         )}
 
