@@ -28,7 +28,7 @@
 
 1. **Double Mode de Rendu (3D Temps Réel & 2D Vectoriel)** :
    - **Mode 3D Réaliste (PBR)** : Présentateur 3D articulé avec éclairage de studio 3-points, textures haute-fidélité, et support d'importation de modèles `.glb` / `.gltf`.
-   - **Mode 2D Vectoriel** : Scène vectorielle interactive fluide et fidèle aux illustrations pédagogiques de référence, gérant la cinématique des bras, poignets et des 5 doigts articulés.
+   - **Mode 2D Vectoriel** : Scène vectorielle interactive fluide aux illustrations pédagogiques de référence, gérant la cinématique des bras, poignets et des 5 doigts articulés.
 
 2. **Caméra Live & Motion Capture (MediaPipe + TensorFlow.js + OpenCV)** :
    - Capture du flux webcam en direct avec analyse cinématique des mains par **MediaPipe Hands** et **TensorFlow.js WASM**.
@@ -57,7 +57,6 @@
 - **Style** : Tailwind CSS.
 - **Rendu 3D** : Three.js avec OrbitControls et RoomEnvironment.
 - **Vision par Ordinateur & IA** : `@mediapipe/hands`, `@mediapipe/camera_utils`, `@tensorflow/tfjs`.
-- **Icônes** : Lucide React.
 
 ---
 
