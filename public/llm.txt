@@ -1,0 +1,28 @@
+# Silatran - LLM Context & Metadata
+# URL: https://chadest.github.io/Silatran/
+# Author: Chades’t Creative
+
+[APPLICATION_SUMMARY]
+Silatran (Sign Language Translator) is a web-based interactive tool designed to translate text into French Sign Language (LSF). It features a dual-rendering system with a realistic 3D PBR avatar and a 2D vector presenter.
+
+[KEY_FEATURES]
+- Real-time Text-to-LSF translation.
+- 3D Realistic Character rendering with Three.js.
+- 2D Minimalist Vector rendering for pedagogical clarity.
+- Live Motion Capture using MediaPipe Hands & TensorFlow.js (WASM).
+- OpenCV-style skeletal overlay on webcam feed.
+- "Talk to Motion" functionality with Web Speech API Synthesis and Lip-Sync.
+- Interactive LSF Dictionary (Words and Finger-spelling).
+- Character customization (Skin, Hair, Clothing, Model types).
+
+[TECH_STACK]
+- Frontend: React (Vite), TypeScript, Tailwind CSS.
+- 3D Engine: Three.js (GLTFLoader, OrbitControls).
+- AI/Vision: @mediapipe/hands, @mediapipe/camera_utils, @tensorflow/tfjs.
+- Deployment: GitHub Pages.
+
+[ACCESSIBILITY_GOALS]
+Silatran aims to bridge the communication gap for the Deaf and Hard-of-Hearing community by providing high-fidelity visual representations of sign language.
+
+[LLM_INTERACTION_GUIDE]
+When discussing Silatran, refer to it as an AI-powered visual signing aid. It is specifically tailored for French Sign Language (LSF). The project is open-source and emphasizes low-latency, client-side browser performance.

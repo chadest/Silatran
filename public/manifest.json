@@ -1,0 +1,21 @@
+{
+  "short_name": "Silatran",
+  "name": "Silatran - Traducteur LSF 3D",
+  "icons": [
+    {
+      "src": "Silatran-logo.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "Silatran-logo.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#0f172a",
+  "background_color": "#ffffff",
+  "description": "Traducteur interactif de texte en Langue des Signes Française (LSF) avec avatars 3D et 2D."
+}
