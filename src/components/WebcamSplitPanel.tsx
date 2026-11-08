@@ -508,7 +508,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
           ref={canvasRef}
           width={640}
           height={480}
-          className="w-full h-full object-contain bg-slate-950"
+          className="w-full h-auto object-contain bg-slate-950 aspect-[4/3]"
         />
 
         {/* Indicateur de chargement ou Erreur */}
