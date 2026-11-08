@@ -1,0 +1,11 @@
+Model Information:
+* title:	teen-boy
+* source:	https://sketchfab.com/3d-models/teen-boy-fff65cd5b0934eff8e3a281766a52bf5
+* author:	theskipper (https://sketchfab.com/theskipper)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "teen-boy" (https://sketchfab.com/3d-models/teen-boy-fff65cd5b0934eff8e3a281766a52bf5) by theskipper (https://sketchfab.com/theskipper) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

@@ -1,0 +1,6 @@
+{
+  "name": "Silatran - Traducteur 3D en Langue des Signes",
+  "description": "Convertisseur de texte en animation 3D réaliste de langue des signes (LSF) avec avatar articulé en temps réel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
