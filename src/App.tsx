@@ -62,7 +62,7 @@ export default function App() {
   // Configuration de l'apparence de l'avatar 3D (Default: Modèle 3D Réaliste Teen Boy enregistré dans le projet)
   const [avatarConfig, setAvatarConfig] = useState<AvatarConfig>({
     modelType: 'glb_custom',
-    glbUrl: '/teen-boy/scene.gltf',
+    glbUrl: 'teen-boy/scene.gltf',
     glbFileName: 'Personnage Réaliste (Teen Boy 3D)',
     glbScale: 1.0,
     glbOffsetY: 0.0,
