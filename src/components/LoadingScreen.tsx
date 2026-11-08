@@ -25,7 +25,7 @@ export const LoadingScreen: React.FC<LoadingScreenProps> = ({ onFinishLoading })
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-white select-none overflow-hidden p-6 space-y-6">
       <img
-        src="/Silatran-logo.gif"
+        src="Silatran-logo.gif"
         alt="Silatran Logo"
         className="w-48 h-48 md:w-64 md:h-64 object-contain"
       />

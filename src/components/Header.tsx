@@ -60,7 +60,7 @@ export const Header: React.FC<HeaderProps> = ({
       {/* Logo Silatran responsive */}
       <div className="flex items-center min-w-0 pr-2">
         <img
-          src="/Silatran-logo.png"
+          src="Silatran-logo.png"
           alt="Silatran"
           className="h-7 sm:h-8 md:h-10 max-w-[120px] sm:max-w-[160px] md:max-w-[200px] w-auto object-contain shrink-0"
         />
