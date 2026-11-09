@@ -1,8 +1,8 @@
 /**
  * @file src/components/WebcamSplitPanel.tsx
- * @description Panneau de capture caméra en direct avec MediaPipe Hands.
+ * @description Panneau de capture caméra en direct avec IA MediaPipe Hands.
  * Affiche directement le flux vidéo webcam réel via un rendu Canvas 60 FPS garanti
- * (élimine tout écran noir de superposition) et dessine le squelette OpenCV des mains.
+ * et superpose le squelette de détection des mains (style OpenCV avec repères articulaires).
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
@@ -16,6 +16,7 @@ import {
   Layers,
   FlipHorizontal,
   Lock,
+  CheckCircle2,
 } from 'lucide-react';
 import {
   buildLiveCameraCharacterPose,
@@ -23,7 +24,7 @@ import {
 } from '../utils/handKinematicsSolver';
 import { CharacterPose } from '../types/signs';
 
-// Version figée stable de MediaPipe Hands (alignée avec package.json)
+// Version stable figée de MediaPipe Hands
 const MEDIAPIPE_HANDS_VERSION = '0.4.1675469240';
 
 export interface MediaPipeResults {
@@ -65,12 +66,28 @@ const FINGER_COLORS = {
   palm: '#10b981',    // Émeraude
 };
 
-// Helper pour charger dynamiquement un script dans le DOM
+// Helper pour charger dynamiquement un script dans le DOM si nécessaire
 function loadScript(src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
+    if (typeof window !== 'undefined' && (window as any).Hands) {
       resolve();
+      return;
+    }
+    const existing = document.querySelector<HTMLScriptElement>(`script[src="${src}"]`);
+    if (existing) {
+      if ((window as any).Hands) {
+        resolve();
+      } else {
+        existing.addEventListener('load', () => resolve(), { once: true });
+        existing.addEventListener('error', (err) => reject(err), { once: true });
+        const checkInterval = setInterval(() => {
+          if ((window as any).Hands) {
+            clearInterval(checkInterval);
+            resolve();
+          }
+        }, 50);
+        setTimeout(() => clearInterval(checkInterval), 6000);
+      }
       return;
     }
     const script = document.createElement('script');
@@ -100,6 +117,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isPermissionDenied, setIsPermissionDenied] = useState(false);
   const [isModelLoading, setIsModelLoading] = useState(false);
+  const [modelReady, setModelReady] = useState(false);
 
   // Options d'affichage
   const [isSyncing, setIsSyncing] = useState(true);
@@ -119,7 +137,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   const frameCountRef = useRef(0);
   const lastFpsTimestampRef = useRef(performance.now());
 
-  // Références stables pour éviter les fuites de closure
+  // Références stables pour éviter les cycles de closure
   const isSyncingRef = useRef(isSyncing);
   useEffect(() => {
     isSyncingRef.current = isSyncing;
@@ -141,32 +159,37 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   const startWidthRef = useRef(panelWidth);
 
   /**
-   * 1. Charger et instancier le moteur MediaPipe Hands
+   * 1. Charger et initialiser le moteur IA MediaPipe Hands
    */
   const initMediaPipeHands = useCallback(async () => {
     if (handsInstanceRef.current) return handsInstanceRef.current;
 
     setIsModelLoading(true);
     try {
-      await loadScript(
-        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_HANDS_VERSION}/hands.js`
-      );
+      if (!(window as any).Hands) {
+        await loadScript(
+          `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_HANDS_VERSION}/hands.js`
+        );
+      }
 
       const HandsConstructor = (window as any).Hands;
       if (!HandsConstructor) {
-        throw new Error('Impossible de charger le constructeur MediaPipe Hands');
+        throw new Error('Constructeur MediaPipe Hands non disponible.');
       }
 
       const hands = new HandsConstructor({
-        locateFile: (file: string) =>
-          `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_HANDS_VERSION}/${file}`,
+        locateFile: (file: string) => {
+          if (file.startsWith('http://') || file.startsWith('https://')) return file;
+          return `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_HANDS_VERSION}/${file}`;
+        },
       });
 
+      // Modèle allégé ultra-rapide (modelComplexity: 0) avec confiance équilibrée pour webcam
       hands.setOptions({
         maxNumHands: 2,
-        modelComplexity: 1,
-        minDetectionConfidence: 0.55,
-        minTrackingConfidence: 0.55,
+        modelComplexity: 0,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5,
       });
 
       hands.onResults((results: MediaPipeResults) => {
@@ -195,7 +218,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
 
           setDetectedHands(labels);
 
-          // Calcul cinématique et transmission à l'avatar 3D / 2D
+          // Transmission cinématique temps réel vers l'avatar 3D / 2D
           if (leftHandLandmarks || rightHandLandmarks) {
             const characterPose = buildLiveCameraCharacterPose(
               leftHandLandmarks,
@@ -213,18 +236,23 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         }
       });
 
+      // Initialisation explicite du graphe WASM et du modèle IA
+      await hands.initialize();
+
       handsInstanceRef.current = hands;
       setIsModelLoading(false);
+      setModelReady(true);
       return hands;
     } catch (err) {
-      console.warn('Initialisation MediaPipe différée:', err);
+      console.warn('Initialisation MediaPipe reportée:', err);
       setIsModelLoading(false);
+      setModelReady(false);
       return null;
     }
   }, []);
 
   /**
-   * 2. Dessiner le squelette OpenCV et les repères de détection sur le Canvas
+   * 2. Dessiner le squelette vectoriel des mains (style OpenCV)
    */
   const drawSkeletalMesh = (
     ctx: CanvasRenderingContext2D,
@@ -238,7 +266,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
       const handedness = results.multiHandedness?.[index];
       const isLeft = handedness?.label === 'Left';
 
-      // 1. Connexions articulaires colorées
+      // 1. Tracer les segments de connexion articulaires
       HAND_CONNECTIONS.forEach(([startIndex, endIndex]) => {
         const start = landmarks[startIndex];
         const end = landmarks[endIndex];
@@ -255,18 +283,19 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         ctx.moveTo(start.x * width, start.y * height);
         ctx.lineTo(end.x * width, end.y * height);
         ctx.strokeStyle = strokeColor;
-        ctx.lineWidth = 3;
+        ctx.lineWidth = 3.5;
         ctx.lineCap = 'round';
         ctx.stroke();
       });
 
-      // 2. Points articulaires (21 repères)
+      // 2. Tracer les 21 points d'articulation avec halo OpenCV
       landmarks.forEach((point, pIdx) => {
         const px = point.x * width;
         const py = point.y * height;
 
+        // Disque externe coloré
         ctx.beginPath();
-        ctx.arc(px, py, pIdx === 0 ? 5.5 : 3.5, 0, 2 * Math.PI);
+        ctx.arc(px, py, pIdx === 0 ? 6 : 4.5, 0, 2 * Math.PI);
         ctx.fillStyle = pIdx === 0 ? '#38bdf8' : '#ffffff';
         ctx.fill();
         ctx.strokeStyle = '#0284c7';
@@ -274,7 +303,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         ctx.stroke();
       });
 
-      // 3. Boîte englobante OpenCV
+      // 3. Boîte englobante OpenCV (Bounding Box)
       let minX = width;
       let minY = height;
       let maxX = 0;
@@ -289,33 +318,76 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         if (py > maxY) maxY = py;
       });
 
-      const pad = 12;
+      const pad = 14;
       minX = Math.max(0, minX - pad);
       minY = Math.max(0, minY - pad);
       maxX = Math.min(width, maxX + pad);
       maxY = Math.min(height, maxY + pad);
 
       ctx.strokeStyle = isLeft ? '#06b6d4' : '#10b981';
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 2;
       ctx.setLineDash([4, 4]);
       ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
       ctx.setLineDash([]);
 
-      // Étiquette textuelle
-      const labelText = isLeft ? 'Main Gauche' : 'Main Droite';
+      // Étiquette OpenCV sur la main
+      const labelText = isLeft ? 'Main Gauche (LSF)' : 'Main Droite (LSF)';
       ctx.font = 'bold 11px sans-serif';
       const textWidth = ctx.measureText(labelText).width;
       ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-      ctx.fillRect(minX, Math.max(0, minY - 18), textWidth + 8, 16);
+      ctx.fillRect(minX, Math.max(0, minY - 20), textWidth + 10, 18);
       ctx.fillStyle = isLeft ? '#38bdf8' : '#34d399';
-      ctx.fillText(labelText, minX + 4, Math.max(12, minY - 6));
+      ctx.fillText(labelText, minX + 5, Math.max(13, minY - 6));
     });
   };
 
   /**
-   * 3. Boucle de rendu Canvas 60 FPS permanente
-   * Peint directement la trame vidéo sur le Canvas (garantissant l'absence d'écran noir)
-   * et superpose le tracé squelettique dès que MediaPipe détecte des mains.
+   * 3. Réticule de détection visuel lorsque les mains entrent dans le champ
+   */
+  const drawDetectionGuide = (
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number
+  ) => {
+    // Coins de repère de ciblage
+    const marginX = width * 0.15;
+    const marginY = height * 0.15;
+    const cornerSize = 24;
+
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.4)';
+    ctx.lineWidth = 2;
+
+    // Haut-Gauche
+    ctx.beginPath();
+    ctx.moveTo(marginX, marginY + cornerSize);
+    ctx.lineTo(marginX, marginY);
+    ctx.lineTo(marginX + cornerSize, marginY);
+    ctx.stroke();
+
+    // Haut-Droite
+    ctx.beginPath();
+    ctx.moveTo(width - marginX - cornerSize, marginY);
+    ctx.lineTo(width - marginX, marginY);
+    ctx.lineTo(width - marginX, marginY + cornerSize);
+    ctx.stroke();
+
+    // Bas-Gauche
+    ctx.beginPath();
+    ctx.moveTo(marginX, height - marginY - cornerSize);
+    ctx.lineTo(marginX, height - marginY);
+    ctx.lineTo(marginX + cornerSize, height - marginY);
+    ctx.stroke();
+
+    // Bas-Droite
+    ctx.beginPath();
+    ctx.moveTo(width - marginX - cornerSize, height - marginY);
+    ctx.lineTo(width - marginX, height - marginY);
+    ctx.lineTo(width - marginX, height - marginY - cornerSize);
+    ctx.stroke();
+  };
+
+  /**
+   * 4. Boucle de rendu Canvas 60 FPS permanente
    */
   const startRenderLoop = useCallback(() => {
     if (renderLoopIdRef.current) {
@@ -330,7 +402,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
       if (video && canvas && video.readyState >= 2) {
         const ctx = canvas.getContext('2d');
         if (ctx) {
-          // Ajuster dynamiquement les dimensions du canvas sur celles du flux vidéo natif
+          // Ajuster les dimensions du canvas au flux caméra
           if (video.videoWidth > 0 && video.videoHeight > 0) {
             if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
               canvas.width = video.videoWidth;
@@ -338,15 +410,21 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
             }
           }
 
-          // A. Dessiner le flux vidéo réel (résout immédiatement le problème d'écran noir)
+          // A. Dessin du flux réel webcam
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-          // B. Dessiner la superposition squelettique si activée
-          if (showMeshOverlayRef.current && lastResultsRef.current) {
+          // B. Dessin du squelette des mains ou du réticule de ciblage
+          if (
+            showMeshOverlayRef.current &&
+            lastResultsRef.current?.multiHandLandmarks &&
+            lastResultsRef.current.multiHandLandmarks.length > 0
+          ) {
             drawSkeletalMesh(ctx, lastResultsRef.current, canvas.width, canvas.height);
+          } else if (showMeshOverlayRef.current) {
+            drawDetectionGuide(ctx, canvas.width, canvas.height);
           }
 
-          // C. Calcul du taux de rafraîchissement FPS
+          // C. Calcul du taux FPS réel
           frameCountRef.current++;
           const now = performance.now();
           if (now - lastFpsTimestampRef.current >= 1000) {
@@ -362,14 +440,17 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
           setIsStreamReady(true);
         }
 
-        // D. Lancer une inférence MediaPipe en tâche de fond si le modèle est prêt
+        // D. Transmission de trames vers l'IA MediaPipe
         const hands = handsInstanceRef.current;
         if (hands && !isDetectingRef.current && !video.paused && !video.ended) {
           isDetectingRef.current = true;
           hands
             .send({ image: video })
             .catch(() => {
-              // Ignore les éventuelles pertes de trames ponctuelles
+              // Repli d'image via canvas si nécessaire
+              if (canvas) {
+                return hands.send({ image: canvas }).catch(() => {});
+              }
             })
             .finally(() => {
               isDetectingRef.current = false;
@@ -384,7 +465,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   }, []);
 
   /**
-   * 4. Démarrer le flux caméra réel via getUserMedia
+   * 5. Démarrer le flux caméra matériel via getUserMedia
    */
   const startCamera = useCallback(async () => {
     setCameraError(null);
@@ -393,18 +474,16 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
     setIsStreamReady(false);
 
     try {
-      // 1. Vérifier la disponibilité de l'API caméra
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("L'API de capture vidéo n'est pas supportée dans ce contexte.");
+        throw new Error("L'API vidéo n'est pas supportée dans ce navigateur.");
       }
 
-      // Arrêter tout flux matériel antérieur pour libérer la caméra
+      // Nettoyer toute piste active précédente
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
         streamRef.current = null;
       }
 
-      // 2. Demander immédiatement le flux vidéo matériel
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -416,14 +495,13 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
           audio: false,
         });
       } catch (firstErr) {
-        // Repli permissif sans contraintes de résolution
         stream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: false,
         });
       }
 
-      // S'assurer que les pistes vidéo matérielles sont actives
+      // Activer explicitement toutes les pistes vidéo
       stream.getVideoTracks().forEach((t) => {
         t.enabled = true;
       });
@@ -432,7 +510,6 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
 
       const video = videoRef.current;
       if (video) {
-        // Configuration stricte des propriétés DOM pour autoriser la lecture automatique
         video.muted = true;
         video.defaultMuted = true;
         video.playsInline = true;
@@ -441,7 +518,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         video.setAttribute('autoplay', 'true');
         video.srcObject = stream;
 
-        // Attente de l'état prêt des trames vidéo
+        // Attente de l'état prêt des trames
         await new Promise<void>((resolve) => {
           const onReady = () => {
             video.removeEventListener('loadeddata', onReady);
@@ -467,10 +544,10 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
       setIsCameraActive(true);
       setIsStarting(false);
 
-      // Démarrer IMMÉDIATEMENT la boucle de rendu Canvas
+      // Démarrage instantané de l'affichage vidéo 60 FPS
       startRenderLoop();
 
-      // Charger le modèle MediaPipe en parallèle sans bloquer la caméra
+      // Démarrage du modèle IA MediaPipe
       initMediaPipeHands().catch((mpErr) => {
         console.warn('MediaPipe initialisation différée:', mpErr);
       });
@@ -490,13 +567,13 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         ) {
           permissionDenied = true;
           msg = 'Autorisation requise : veuillez autoriser l’accès à la caméra pour activer le suivi en direct.';
-          console.warn('Accès caméra en attente d’autorisation utilisateur:', err.message);
+          console.warn('Accès caméra en attente d’autorisation:', err.message);
         } else if (
           err.name === 'NotFoundError' ||
           err.name === 'DevicesNotFoundError'
         ) {
           msg = 'Aucun périphérique caméra détecté sur cet appareil.';
-          console.warn('Périphérique caméra non trouvé:', err.message);
+          console.warn('Caméra non détectée:', err.message);
         } else if (
           err.name === 'NotReadableError' ||
           err.name === 'TrackStartError'
@@ -517,7 +594,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   }, [initMediaPipeHands, startRenderLoop]);
 
   /**
-   * 5. Arrêter la caméra et libérer les flux matériels
+   * 6. Arrêter la caméra et libérer les périphériques
    */
   const stopCamera = useCallback(() => {
     if (renderLoopIdRef.current) {
@@ -554,7 +631,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
     onPoseUpdateRef.current(null);
   }, []);
 
-  // Démarrer ou arrêter selon l'ouverture du panneau
+  // Cycle de vie selon l'ouverture du volet
   useEffect(() => {
     if (isOpen) {
       startCamera();
@@ -566,7 +643,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
     };
   }, [isOpen, startCamera, stopCamera]);
 
-  // Nettoyage au démontage complet du composant
+  // Nettoyage au démontage final
   useEffect(() => {
     return () => {
       if (renderLoopIdRef.current) {
@@ -584,7 +661,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   }, []);
 
   /**
-   * Gestion du redimensionnement par glissement de la poignée
+   * Redimensionnement par glissement latéral
    */
   const handleMouseDownResize = (e: React.MouseEvent) => {
     isDraggingRef.current = true;
@@ -615,7 +692,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
       style={{ width: `${panelWidth}px` }}
       className="relative h-full bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl z-20 shrink-0 transition-all duration-75 select-none"
     >
-      {/* Poignée de redimensionnement latérale */}
+      {/* Poignée de redimensionnement */}
       <div
         onMouseDown={handleMouseDownResize}
         title="Glisser pour redimensionner"
@@ -650,7 +727,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
             className={`px-2 py-1 rounded text-[10px] font-bold transition-colors flex items-center space-x-1 ${
               isSyncing ? 'bg-sky-500 text-white' : 'bg-slate-800 text-slate-400'
             }`}
-            title="Activer ou suspendre la synchronisation avec l'avatar"
+            title="Activer ou suspendre la synchronisation avec l'avatar 3D"
           >
             <Activity className="w-3 h-3" />
             <span>{isSyncing ? 'SYNCHRO ON' : 'SYNCHRO OFF'}</span>
@@ -675,16 +752,16 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
             isMirrored ? 'scale-x-[-1]' : ''
           }`}
         >
-          {/* Vidéo source de capture (décode les trames en continu en arrière-plan) */}
+          {/* Vidéo source de capture matérielle (non-masquée pour garantir le décodage GPU WebGL) */}
           <video
             ref={videoRef}
             autoPlay
             playsInline
             muted
-            className="absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none"
+            className="absolute inset-0 w-full h-full object-cover pointer-events-none -z-10"
           />
 
-          {/* Canvas principal composite (Affiche directement le flux vidéo webcam + squelette OpenCV) */}
+          {/* Canvas principal composite (Affiche le flux webcam réel + le squelette OpenCV) */}
           <canvas
             ref={canvasRef}
             width={640}
@@ -693,7 +770,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
           />
         </div>
 
-        {/* Chargement initial lors de l'accès matériel */}
+        {/* Chargement initial lors de l'accès caméra */}
         {(isStarting || (!isStreamReady && isCameraActive && !cameraError)) && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 space-y-3 z-10 p-4 text-center">
             <RefreshCw className="w-7 h-7 text-sky-400 animate-spin" />
@@ -704,15 +781,15 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
           </div>
         )}
 
-        {/* État de chargement discret du modèle IA en tâche de fond */}
+        {/* État de chargement du modèle IA en tâche de fond */}
         {isCameraActive && isStreamReady && isModelLoading && (
-          <div className="absolute bottom-3 left-3 z-10 bg-slate-950/85 border border-slate-800 px-2 py-1 rounded text-[10px] text-sky-400 flex items-center space-x-1.5">
-            <RefreshCw className="w-3 h-3 animate-spin" />
-            <span>Chargement du modèle MediaPipe Hands...</span>
+          <div className="absolute bottom-3 left-3 z-10 bg-slate-950/85 border border-slate-800 px-2.5 py-1.5 rounded text-[10px] text-sky-400 flex items-center space-x-1.5 backdrop-blur-xs">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            <span>Chargement IA MediaPipe Hands...</span>
           </div>
         )}
 
-        {/* Gestion des erreurs de permission avec instructions claires */}
+        {/* Gestion des erreurs de permission */}
         {cameraError && !isStarting && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/95 p-6 text-center space-y-4 z-10">
             {isPermissionDenied ? (
@@ -738,7 +815,7 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
                       Cliquez sur le bouton ci-dessous pour déclencher la demande du navigateur.
                     </li>
                     <li>
-                      Si bloquée, cliquez sur l’icône de <strong className="text-white">cadenas</strong> dans l’adresse du navigateur et choisissez <strong className="text-emerald-400">Autoriser</strong>.
+                      Si bloquée, cliquez sur le <strong className="text-white">cadenas</strong> dans l’adresse du navigateur et choisissez <strong className="text-emerald-400">Autoriser</strong>.
                     </li>
                   </ol>
                 </div>
@@ -762,9 +839,12 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
             <div className="flex items-center space-x-2 text-[10px] font-mono">
               <span className="text-sky-400 font-bold">{fps} FPS</span>
               <span className="text-slate-600">|</span>
-              <span className={detectedHands.length > 0 ? 'text-emerald-400 font-bold' : 'text-slate-500'}>
-                {detectedHands.length > 0 ? detectedHands.join(' + ') : 'Aucune main détectée'}
-              </span>
+              <div className="flex items-center space-x-1">
+                {modelReady && <CheckCircle2 className="w-3 h-3 text-emerald-400 inline" />}
+                <span className={detectedHands.length > 0 ? 'text-emerald-400 font-bold' : 'text-slate-400'}>
+                  {detectedHands.length > 0 ? detectedHands.join(' + ') : 'Placez vos mains face caméra'}
+                </span>
+              </div>
             </div>
           </div>
         )}
