@@ -1,10 +1,9 @@
 /**
  * @file src/components/WebcamSplitPanel.tsx
- * @description Panneau rétractable et redimensionnable de la caméra en direct.
- * Capture le flux vidéo webcam via MediaPipe Hands & TensorFlow.js WASM,
- * dessine la superstructure squelettique style OpenCV sur Canvas et synchronise les mouvements de mains en temps réel.
+ * @description Panneau de capture caméra en direct avec MediaPipe Hands.
+ * Affiche directement le flux vidéo webcam réel via un rendu Canvas 60 FPS garanti
+ * (élimine tout écran noir de superposition) et dessine le squelette OpenCV des mains.
  */
-
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
@@ -14,6 +13,9 @@ import {
   AlertCircle,
   X,
   Activity,
+  Layers,
+  FlipHorizontal,
+  Lock,
 } from 'lucide-react';
 import {
   buildLiveCameraCharacterPose,
@@ -21,26 +23,12 @@ import {
 } from '../utils/handKinematicsSolver';
 import { CharacterPose } from '../types/signs';
 
-export type MediaPipeResults = {
-  image: HTMLVideoElement | HTMLCanvasElement;
+// Version figée stable de MediaPipe Hands (alignée avec package.json)
+const MEDIAPIPE_HANDS_VERSION = '0.4.1675469240';
+
+export interface MediaPipeResults {
   multiHandLandmarks?: MediaPipeLandmark[][];
   multiHandedness?: Array<{ label: string; score: number }>;
-};
-
-// Chargeur dynamique de scripts CDN MediaPipe
-function loadScript(src: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) {
-      resolve();
-      return;
-    }
-    const script = document.createElement('script');
-    script.src = src;
-    script.crossOrigin = 'anonymous';
-    script.onload = () => resolve();
-    script.onerror = (err) => reject(err);
-    document.head.appendChild(script);
-  });
 }
 
 interface WebcamSplitPanelProps {
@@ -51,7 +39,7 @@ interface WebcamSplitPanelProps {
   onResizePanel: (newWidth: number) => void;
 }
 
-// Connections squelettiques MediaPipe des 21 repères de la main
+// Connexions squelettiques standard MediaPipe (21 points)
 const HAND_CONNECTIONS: Array<[number, number]> = [
   // Pouce
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -67,15 +55,32 @@ const HAND_CONNECTIONS: Array<[number, number]> = [
   [5, 9], [9, 13], [13, 17],
 ];
 
-// Couleurs OpenCV par doigt
+// Palette de couleurs pour chaque doigt (style OpenCV)
 const FINGER_COLORS = {
-  thumb: '#f59e0b',  // Ambre / Jaune
-  index: '#06b6d4',  // Cyan
-  middle: '#3b82f6', // Bleu
-  ring: '#8b5cf6',   // Violet
-  pinky: '#ec4899',  // Rose
-  palm: '#10b981',   // Émeraude
+  thumb: '#f59e0b',   // Ambre
+  index: '#06b6d4',   // Cyan
+  middle: '#3b82f6',  // Bleu
+  ring: '#8b5cf6',    // Violet
+  pinky: '#ec4899',   // Rose
+  palm: '#10b981',    // Émeraude
 };
+
+// Helper pour charger dynamiquement un script dans le DOM
+function loadScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      resolve();
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.crossOrigin = 'anonymous';
+    script.onload = () => resolve();
+    script.onerror = (err) => reject(err);
+    document.head.appendChild(script);
+  });
+}
 
 export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   isOpen,
@@ -86,200 +91,470 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
+  // États du flux vidéo
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isStreamReady, setIsStreamReady] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [isPermissionDenied, setIsPermissionDenied] = useState(false);
+  const [isModelLoading, setIsModelLoading] = useState(false);
+
+  // Options d'affichage
   const [isSyncing, setIsSyncing] = useState(true);
   const [isMirrored, setIsMirrored] = useState(true);
   const [showMeshOverlay, setShowMeshOverlay] = useState(true);
+
+  // Métriques en temps réel
   const [fps, setFps] = useState(0);
-  const [detectedHandCount, setDetectedHandCount] = useState(0);
-  const [handLabels, setHandLabels] = useState<string[]>([]);
+  const [detectedHands, setDetectedHands] = useState<string[]>([]);
 
-  // Lissage cinématique
-  const [smoothingFactor, setSmoothingFactor] = useState(0.4);
+  // Références d'exécution et de rendu
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const handsInstanceRef = useRef<any>(null);
+  const isDetectingRef = useRef(false);
+  const renderLoopIdRef = useRef<number | null>(null);
+  const lastResultsRef = useRef<MediaPipeResults | null>(null);
+  const frameCountRef = useRef(0);
+  const lastFpsTimestampRef = useRef(performance.now());
 
-  // Redimensionnement par glissement de la poignée
+  // Références stables pour éviter les fuites de closure
+  const isSyncingRef = useRef(isSyncing);
+  useEffect(() => {
+    isSyncingRef.current = isSyncing;
+  }, [isSyncing]);
+
+  const onPoseUpdateRef = useRef(onPoseUpdate);
+  useEffect(() => {
+    onPoseUpdateRef.current = onPoseUpdate;
+  }, [onPoseUpdate]);
+
+  const showMeshOverlayRef = useRef(showMeshOverlay);
+  useEffect(() => {
+    showMeshOverlayRef.current = showMeshOverlay;
+  }, [showMeshOverlay]);
+
+  // Redimensionnement de la poignée latérale
   const isDraggingRef = useRef(false);
   const startXRef = useRef(0);
   const startWidthRef = useRef(panelWidth);
 
-  // Compteurs FPS & Références MediaPipe
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  const frameCountRef = useRef(0);
-  const lastFpsTimeRef = useRef(performance.now());
-  const handsInstanceRef = useRef<any>(null);
-  const cameraInstanceRef = useRef<any>(null);
+  /**
+   * 1. Charger et instancier le moteur MediaPipe Hands
+   */
+  const initMediaPipeHands = useCallback(async () => {
+    if (handsInstanceRef.current) return handsInstanceRef.current;
 
-  // Basculer l'état de synchronisation avec le modèle
-  const handleToggleSync = () => {
-    const nextState = !isSyncing;
-    setIsSyncing(nextState);
-    if (!nextState) {
-      onPoseUpdate(null);
-    }
-  };
-
-  // Chargement et initialisation de MediaPipe au montage
-  useEffect(() => {
-    let isMounted = true;
-
-    async function initMediaPipe() {
-      try {
-        await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
-        await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
-
-        const HandsConstructor = (window as any).Hands;
-        if (!HandsConstructor) throw new Error('Hands module not loaded');
-
-        const hands = new HandsConstructor({
-          locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-        });
-
-        hands.setOptions({
-          maxNumHands: 2,
-          modelComplexity: 1,
-          minDetectionConfidence: 0.55,
-          minTrackingConfidence: 0.55,
-        });
-
-        hands.onResults((results: MediaPipeResults) => {
-          if (!isMounted) return;
-          // ... [Logique de rendu et poseUpdate inchangée] ...
-          frameCountRef.current++;
-          const now = performance.now();
-          if (now - lastFpsTimeRef.current >= 1000) {
-            setFps(Math.round((frameCountRef.current * 1000) / (now - lastFpsTimeRef.current)));
-            frameCountRef.current = 0;
-            lastFpsTimeRef.current = now;
-          }
-
-          drawOpenCVOverlay(results);
-
-          let leftHand: MediaPipeLandmark[] | null = null;
-          let rightHand: MediaPipeLandmark[] | null = null;
-          const labels: string[] = [];
-
-          if (results.multiHandLandmarks && results.multiHandedness) {
-            setDetectedHandCount(results.multiHandLandmarks.length);
-            results.multiHandedness.forEach((handedness, idx) => {
-              const label = handedness.label;
-              const landmarks = results.multiHandLandmarks?.[idx] as MediaPipeLandmark[] | undefined;
-              if (!landmarks) return;
-              labels.push(label === 'Left' ? 'Main Gauche' : 'Main Droite');
-              if (label === 'Left') leftHand = landmarks;
-              else rightHand = landmarks;
-            });
-            setHandLabels(labels);
-          } else {
-            setDetectedHandCount(0);
-            setHandLabels([]);
-          }
-
-          if (leftHand || rightHand) {
-            const rawPose = buildLiveCameraCharacterPose(leftHand, rightHand);
-            if (isSyncing) onPoseUpdate(rawPose);
-          } else if (isSyncing) {
-            onPoseUpdate(null);
-          }
-        });
-
-        handsInstanceRef.current = hands;
-      } catch (err) {
-        console.error('MediaPipe Init Error:', err);
-      }
-    }
-
-    initMediaPipe();
-
-    return () => {
-      isMounted = false;
-      if (handsInstanceRef.current) {
-        handsInstanceRef.current.close().catch(console.error);
-        handsInstanceRef.current = null;
-      }
-    };
-  }, []);
-
-  // Démarrer la webcam
-  const startCamera = useCallback(async () => {
-    setCameraError(null);
+    setIsModelLoading(true);
     try {
-      const CameraConstructor = (window as any).Camera;
-      if (!CameraConstructor) throw new Error('Camera module not loaded');
+      await loadScript(
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_HANDS_VERSION}/hands.js`
+      );
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: false,
+      const HandsConstructor = (window as any).Hands;
+      if (!HandsConstructor) {
+        throw new Error('Impossible de charger le constructeur MediaPipe Hands');
+      }
+
+      const hands = new HandsConstructor({
+        locateFile: (file: string) =>
+          `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_HANDS_VERSION}/${file}`,
       });
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.55,
+        minTrackingConfidence: 0.55,
+      });
+
+      hands.onResults((results: MediaPipeResults) => {
+        lastResultsRef.current = results;
+
+        let leftHandLandmarks: MediaPipeLandmark[] | null = null;
+        let rightHandLandmarks: MediaPipeLandmark[] | null = null;
+        const labels: string[] = [];
+
+        if (
+          results.multiHandLandmarks &&
+          results.multiHandedness &&
+          results.multiHandLandmarks.length > 0
+        ) {
+          results.multiHandLandmarks.forEach((landmarks, index) => {
+            const handedness = results.multiHandedness?.[index];
+            const label = handedness?.label || 'Hand';
+            labels.push(label === 'Left' ? 'Main Gauche' : 'Main Droite');
+
+            if (label === 'Left') {
+              leftHandLandmarks = landmarks;
+            } else {
+              rightHandLandmarks = landmarks;
+            }
+          });
+
+          setDetectedHands(labels);
+
+          // Calcul cinématique et transmission à l'avatar 3D / 2D
+          if (leftHandLandmarks || rightHandLandmarks) {
+            const characterPose = buildLiveCameraCharacterPose(
+              leftHandLandmarks,
+              rightHandLandmarks
+            );
+            if (isSyncingRef.current) {
+              onPoseUpdateRef.current(characterPose);
+            }
+          }
+        } else {
+          setDetectedHands([]);
+          if (isSyncingRef.current) {
+            onPoseUpdateRef.current(null);
+          }
+        }
+      });
+
+      handsInstanceRef.current = hands;
+      setIsModelLoading(false);
+      return hands;
+    } catch (err) {
+      console.warn('Initialisation MediaPipe différée:', err);
+      setIsModelLoading(false);
+      return null;
+    }
+  }, []);
+
+  /**
+   * 2. Dessiner le squelette OpenCV et les repères de détection sur le Canvas
+   */
+  const drawSkeletalMesh = (
+    ctx: CanvasRenderingContext2D,
+    results: MediaPipeResults,
+    width: number,
+    height: number
+  ) => {
+    if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) return;
+
+    results.multiHandLandmarks.forEach((landmarks, index) => {
+      const handedness = results.multiHandedness?.[index];
+      const isLeft = handedness?.label === 'Left';
+
+      // 1. Connexions articulaires colorées
+      HAND_CONNECTIONS.forEach(([startIndex, endIndex]) => {
+        const start = landmarks[startIndex];
+        const end = landmarks[endIndex];
+        if (!start || !end) return;
+
+        let strokeColor = FINGER_COLORS.palm;
+        if (endIndex <= 4) strokeColor = FINGER_COLORS.thumb;
+        else if (endIndex <= 8) strokeColor = FINGER_COLORS.index;
+        else if (endIndex <= 12) strokeColor = FINGER_COLORS.middle;
+        else if (endIndex <= 16) strokeColor = FINGER_COLORS.ring;
+        else strokeColor = FINGER_COLORS.pinky;
+
+        ctx.beginPath();
+        ctx.moveTo(start.x * width, start.y * height);
+        ctx.lineTo(end.x * width, end.y * height);
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = 3;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+      });
+
+      // 2. Points articulaires (21 repères)
+      landmarks.forEach((point, pIdx) => {
+        const px = point.x * width;
+        const py = point.y * height;
+
+        ctx.beginPath();
+        ctx.arc(px, py, pIdx === 0 ? 5.5 : 3.5, 0, 2 * Math.PI);
+        ctx.fillStyle = pIdx === 0 ? '#38bdf8' : '#ffffff';
+        ctx.fill();
+        ctx.strokeStyle = '#0284c7';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      });
+
+      // 3. Boîte englobante OpenCV
+      let minX = width;
+      let minY = height;
+      let maxX = 0;
+      let maxY = 0;
+
+      landmarks.forEach((p) => {
+        const px = p.x * width;
+        const py = p.y * height;
+        if (px < minX) minX = px;
+        if (py < minY) minY = py;
+        if (px > maxX) maxX = px;
+        if (py > maxY) maxY = py;
+      });
+
+      const pad = 12;
+      minX = Math.max(0, minX - pad);
+      minY = Math.max(0, minY - pad);
+      maxX = Math.min(width, maxX + pad);
+      maxY = Math.min(height, maxY + pad);
+
+      ctx.strokeStyle = isLeft ? '#06b6d4' : '#10b981';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
+      ctx.setLineDash([]);
+
+      // Étiquette textuelle
+      const labelText = isLeft ? 'Main Gauche' : 'Main Droite';
+      ctx.font = 'bold 11px sans-serif';
+      const textWidth = ctx.measureText(labelText).width;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.fillRect(minX, Math.max(0, minY - 18), textWidth + 8, 16);
+      ctx.fillStyle = isLeft ? '#38bdf8' : '#34d399';
+      ctx.fillText(labelText, minX + 4, Math.max(12, minY - 6));
+    });
+  };
+
+  /**
+   * 3. Boucle de rendu Canvas 60 FPS permanente
+   * Peint directement la trame vidéo sur le Canvas (garantissant l'absence d'écran noir)
+   * et superpose le tracé squelettique dès que MediaPipe détecte des mains.
+   */
+  const startRenderLoop = useCallback(() => {
+    if (renderLoopIdRef.current) {
+      cancelAnimationFrame(renderLoopIdRef.current);
+      renderLoopIdRef.current = null;
+    }
+
+    const tick = () => {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+
+      if (video && canvas && video.readyState >= 2) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          // Ajuster dynamiquement les dimensions du canvas sur celles du flux vidéo natif
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+              canvas.width = video.videoWidth;
+              canvas.height = video.videoHeight;
+            }
+          }
+
+          // A. Dessiner le flux vidéo réel (résout immédiatement le problème d'écran noir)
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+          // B. Dessiner la superposition squelettique si activée
+          if (showMeshOverlayRef.current && lastResultsRef.current) {
+            drawSkeletalMesh(ctx, lastResultsRef.current, canvas.width, canvas.height);
+          }
+
+          // C. Calcul du taux de rafraîchissement FPS
+          frameCountRef.current++;
+          const now = performance.now();
+          if (now - lastFpsTimestampRef.current >= 1000) {
+            setFps(
+              Math.round(
+                (frameCountRef.current * 1000) / (now - lastFpsTimestampRef.current)
+              )
+            );
+            frameCountRef.current = 0;
+            lastFpsTimestampRef.current = now;
+          }
+
+          setIsStreamReady(true);
+        }
+
+        // D. Lancer une inférence MediaPipe en tâche de fond si le modèle est prêt
+        const hands = handsInstanceRef.current;
+        if (hands && !isDetectingRef.current && !video.paused && !video.ended) {
+          isDetectingRef.current = true;
+          hands
+            .send({ image: video })
+            .catch(() => {
+              // Ignore les éventuelles pertes de trames ponctuelles
+            })
+            .finally(() => {
+              isDetectingRef.current = false;
+            });
+        }
       }
 
-      if (videoRef.current && handsInstanceRef.current) {
-        const camera = new CameraConstructor(videoRef.current, {
-          onFrame: async () => {
-            if (videoRef.current && handsInstanceRef.current) {
-              await handsInstanceRef.current.send({ image: videoRef.current });
-            }
+      renderLoopIdRef.current = requestAnimationFrame(tick);
+    };
+
+    renderLoopIdRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  /**
+   * 4. Démarrer le flux caméra réel via getUserMedia
+   */
+  const startCamera = useCallback(async () => {
+    setCameraError(null);
+    setIsPermissionDenied(false);
+    setIsStarting(true);
+    setIsStreamReady(false);
+
+    try {
+      // 1. Vérifier la disponibilité de l'API caméra
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("L'API de capture vidéo n'est pas supportée dans ce contexte.");
+      }
+
+      // Arrêter tout flux matériel antérieur pour libérer la caméra
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+
+      // 2. Demander immédiatement le flux vidéo matériel
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: 'user',
           },
-          width: 640,
-          height: 480,
+          audio: false,
+        });
+      } catch (firstErr) {
+        // Repli permissif sans contraintes de résolution
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      }
+
+      // S'assurer que les pistes vidéo matérielles sont actives
+      stream.getVideoTracks().forEach((t) => {
+        t.enabled = true;
+      });
+
+      streamRef.current = stream;
+
+      const video = videoRef.current;
+      if (video) {
+        // Configuration stricte des propriétés DOM pour autoriser la lecture automatique
+        video.muted = true;
+        video.defaultMuted = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', 'true');
+        video.setAttribute('muted', 'true');
+        video.setAttribute('autoplay', 'true');
+        video.srcObject = stream;
+
+        // Attente de l'état prêt des trames vidéo
+        await new Promise<void>((resolve) => {
+          const onReady = () => {
+            video.removeEventListener('loadeddata', onReady);
+            video.removeEventListener('canplay', onReady);
+            resolve();
+          };
+          if (video.readyState >= 2) {
+            resolve();
+          } else {
+            video.addEventListener('loadeddata', onReady, { once: true });
+            video.addEventListener('canplay', onReady, { once: true });
+            setTimeout(resolve, 800);
+          }
         });
 
-        await camera.start();
-        cameraInstanceRef.current = camera;
+        try {
+          await video.play();
+        } catch (playErr) {
+          console.warn('Lecture vidéo différée:', playErr);
+        }
       }
 
       setIsCameraActive(true);
+      setIsStarting(false);
+
+      // Démarrer IMMÉDIATEMENT la boucle de rendu Canvas
+      startRenderLoop();
+
+      // Charger le modèle MediaPipe en parallèle sans bloquer la caméra
+      initMediaPipeHands().catch((mpErr) => {
+        console.warn('MediaPipe initialisation différée:', mpErr);
+      });
     } catch (err: unknown) {
-      // ... [Gestion erreur inchangée] ...
-      let msg = 'Accès caméra refusé. Veuillez autoriser la caméra dans les paramètres de votre navigateur.';
-      if (err instanceof Error && (err as any).name === 'NotAllowedError') {
-         msg = 'Accès à la caméra refusé. Cliquez sur l\'icône de caméra dans la barre d\'adresse pour autoriser l\'accès.';
-      } else if (err instanceof Error) {
-         msg = `Erreur caméra : ${err.message}`;
-      }
-      setCameraError(msg);
+      setIsStarting(false);
       setIsCameraActive(false);
+      setIsStreamReady(false);
+
+      let msg = 'Impossible d’accéder à la caméra.';
+      let permissionDenied = false;
+
+      if (err instanceof Error) {
+        if (
+          err.name === 'NotAllowedError' ||
+          err.name === 'PermissionDeniedError' ||
+          err.message.toLowerCase().includes('permission')
+        ) {
+          permissionDenied = true;
+          msg = 'Autorisation requise : veuillez autoriser l’accès à la caméra pour activer le suivi en direct.';
+          console.warn('Accès caméra en attente d’autorisation utilisateur:', err.message);
+        } else if (
+          err.name === 'NotFoundError' ||
+          err.name === 'DevicesNotFoundError'
+        ) {
+          msg = 'Aucun périphérique caméra détecté sur cet appareil.';
+          console.warn('Périphérique caméra non trouvé:', err.message);
+        } else if (
+          err.name === 'NotReadableError' ||
+          err.name === 'TrackStartError'
+        ) {
+          msg = 'La caméra est déjà utilisée par une autre application.';
+          console.warn('Périphérique caméra occupé:', err.message);
+        } else {
+          msg = err.message;
+          console.warn('Erreur accès caméra:', err.message);
+        }
+      } else {
+        console.warn('Erreur inconnue caméra:', err);
+      }
+
+      setIsPermissionDenied(permissionDenied);
+      setCameraError(msg);
     }
-  }, [onPoseUpdate]);
+  }, [initMediaPipeHands, startRenderLoop]);
 
-
-  // Arrêter la caméra et détruire les instances
+  /**
+   * 5. Arrêter la caméra et libérer les flux matériels
+   */
   const stopCamera = useCallback(() => {
-    if (cameraInstanceRef.current) {
-      try {
-        cameraInstanceRef.current.stop();
-      } catch {
-        // Ignorer
-      }
-      cameraInstanceRef.current = null;
+    if (renderLoopIdRef.current) {
+      cancelAnimationFrame(renderLoopIdRef.current);
+      renderLoopIdRef.current = null;
     }
 
-    if (handsInstanceRef.current) {
-      try {
-        handsInstanceRef.current.close();
-      } catch {
-        // Ignorer
-      }
-      handsInstanceRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => {
+        track.stop();
+      });
+      streamRef.current = null;
     }
 
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach((track) => track.stop());
+    if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
 
-    setHandLabels([]);
-    setFps(0);
-    onPoseUpdate(null);
-  }, [onPoseUpdate]);
+    if (canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) {
+        ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+      }
+    }
 
-  // Démarrer/arrêter la caméra selon l'ouverture du panneau
+    lastResultsRef.current = null;
+    setIsCameraActive(false);
+    setIsStarting(false);
+    setIsStreamReady(false);
+    setCameraError(null);
+    setIsPermissionDenied(false);
+    setDetectedHands([]);
+    setFps(0);
+    onPoseUpdateRef.current(null);
+  }, []);
+
+  // Démarrer ou arrêter selon l'ouverture du panneau
   useEffect(() => {
     if (isOpen) {
       startCamera();
@@ -291,135 +566,26 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
     };
   }, [isOpen, startCamera, stopCamera]);
 
-  // Rendu Canvas OpenCV-style (Squelette vectoriel, jointures et métriques)
-  const drawOpenCVOverlay = (results: MediaPipeResults) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const width = canvas.width;
-    const height = canvas.height;
-
-    ctx.save();
-    ctx.clearRect(0, 0, width, height);
-
-    // Dessiner le flux vidéo en arrière-plan
-    if (results.image) {
-      ctx.save();
-      if (isMirrored) {
-        ctx.translate(width, 0);
-        ctx.scale(-1, 1);
+  // Nettoyage au démontage complet du composant
+  useEffect(() => {
+    return () => {
+      if (renderLoopIdRef.current) {
+        cancelAnimationFrame(renderLoopIdRef.current);
       }
-      ctx.drawImage(results.image, 0, 0, width, height);
-      ctx.restore();
-    }
-
-    // Filtre assombrissant léger pour faire ressortir le squelette OpenCV
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.35)';
-    ctx.fillRect(0, 0, width, height);
-
-    if (showMeshOverlay && results.multiHandLandmarks) {
-      results.multiHandLandmarks.forEach((landmarks, hIdx) => {
-        ctx.save();
-        if (isMirrored) {
-          ctx.translate(width, 0);
-          ctx.scale(-1, 1);
+      if (handsInstanceRef.current) {
+        try {
+          handsInstanceRef.current.close();
+        } catch {
+          // Ignorer
         }
+        handsInstanceRef.current = null;
+      }
+    };
+  }, []);
 
-        // 1. Tracer les segments de connexion squelettiques
-        HAND_CONNECTIONS.forEach(([i, j]) => {
-          const pt1 = landmarks[i];
-          const pt2 = landmarks[j];
-
-          const x1 = pt1.x * width;
-          const y1 = pt1.y * height;
-          const x2 = pt2.x * width;
-          const y2 = pt2.y * height;
-
-          // Déterminer la couleur selon le doigt
-          let strokeColor = FINGER_COLORS.palm;
-          if (j <= 4) strokeColor = FINGER_COLORS.thumb;
-          else if (j <= 8) strokeColor = FINGER_COLORS.index;
-          else if (j <= 12) strokeColor = FINGER_COLORS.middle;
-          else if (j <= 16) strokeColor = FINGER_COLORS.ring;
-          else strokeColor = FINGER_COLORS.pinky;
-
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.strokeStyle = strokeColor;
-          ctx.lineWidth = 3.5;
-          ctx.lineCap = 'round';
-          ctx.stroke();
-        });
-
-        // 2. Tracer les points d'articulation (Joint Nodes)
-        landmarks.forEach((pt, pIdx) => {
-          const x = pt.x * width;
-          const y = pt.y * height;
-          const zDepth = pt.z || 0;
-          const radius = Math.max(3, 6 - zDepth * 15);
-
-          ctx.beginPath();
-          ctx.arc(x, y, radius, 0, Math.PI * 2);
-          ctx.fillStyle = pIdx === 0 ? '#38bdf8' : '#ffffff';
-          ctx.fill();
-          ctx.strokeStyle = '#0284c7';
-          ctx.lineWidth = 1.5;
-          ctx.stroke();
-
-          // Afficher le numéro d'index de joint OpenCV sur les bouts de doigts
-          if ([4, 8, 12, 16, 20].includes(pIdx)) {
-            ctx.fillStyle = '#0f172a';
-            ctx.font = 'bold 9px sans-serif';
-            ctx.fillText(String(pIdx), x - 3, y + 3);
-          }
-        });
-
-        // 3. Dessiner la boîte englobante (Bounding Box OpenCV)
-        let minX = width;
-        let minY = height;
-        let maxX = 0;
-        let maxY = 0;
-
-        landmarks.forEach((pt) => {
-          const px = pt.x * width;
-          const py = pt.y * height;
-          if (px < minX) minX = px;
-          if (py < minY) minY = py;
-          if (px > maxX) maxX = px;
-          if (py > maxY) maxY = py;
-        });
-
-        const pad = 12;
-        minX = Math.max(0, minX - pad);
-        minY = Math.max(0, minY - pad);
-        maxX = Math.min(width, maxX + pad);
-        maxY = Math.min(height, maxY + pad);
-
-        ctx.strokeStyle = '#38bdf8';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([4, 4]);
-        ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
-        ctx.setLineDash([]);
-
-        // Libellé de main sur le rectangle
-        const handLabel = results.multiHandedness?.[hIdx]?.label === 'Left' ? 'MAIN GAUCHE' : 'MAIN DROITE';
-        ctx.fillStyle = '#38bdf8';
-        ctx.fillRect(minX, minY - 18, 90, 18);
-        ctx.fillStyle = '#0f172a';
-        ctx.font = 'bold 10px sans-serif';
-        ctx.fillText(handLabel, minX + 6, minY - 5);
-
-        ctx.restore();
-      });
-    }
-
-    ctx.restore();
-  };
-
-  // Gestion du glissement pour le redimensionnement du panneau
+  /**
+   * Gestion du redimensionnement par glissement de la poignée
+   */
   const handleMouseDownResize = (e: React.MouseEvent) => {
     isDraggingRef.current = true;
     startXRef.current = e.clientX;
@@ -428,8 +594,8 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
     const handleMouseMove = (moveEvent: MouseEvent) => {
       if (!isDraggingRef.current) return;
       const deltaX = startXRef.current - moveEvent.clientX;
-      const newW = Math.max(280, Math.min(640, startWidthRef.current + deltaX));
-      onResizePanel(newW);
+      const newWidth = Math.max(280, Math.min(720, startWidthRef.current + deltaX));
+      onResizePanel(newWidth);
     };
 
     const handleMouseUp = () => {
@@ -447,43 +613,53 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
   return (
     <aside
       style={{ width: `${panelWidth}px` }}
-      className="relative h-full bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl z-20 shrink-0 transition-all duration-75"
+      className="relative h-full bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl z-20 shrink-0 transition-all duration-75 select-none"
     >
-      {/* Poignée de redimensionnement verticale à gauche */}
+      {/* Poignée de redimensionnement latérale */}
       <div
         onMouseDown={handleMouseDownResize}
-        title="Glisser pour redimensionner le panneau caméra"
-        className="absolute top-0 bottom-0 left-0 w-2 cursor-col-resize hover:bg-sky-500/50 active:bg-sky-400 z-30 transition-colors flex items-center justify-center group"
+        title="Glisser pour redimensionner"
+        className="absolute top-0 bottom-0 left-0 w-2 cursor-col-resize hover:bg-sky-500/50 z-30 transition-colors flex items-center justify-center group"
       >
         <div className="w-0.5 h-8 bg-slate-600 group-hover:bg-white rounded-full" />
       </div>
 
-      {/* En-tête du panneau Caméra OpenCV & MediaPipe */}
-      <div className="flex items-center justify-between px-4 py-3 bg-slate-950 border-b border-slate-800">
+      {/* En-tête du panneau */}
+      <div className="flex items-center justify-between px-4 py-3 bg-slate-950 border-b border-slate-800 shrink-0">
         <div className="flex items-center space-x-2">
-          <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
-          <span className="font-bold text-sm text-slate-100 tracking-tight">Caméra Motion Capture</span>
+          <div
+            className={`w-2.5 h-2.5 rounded-full ${
+              isCameraActive && isStreamReady
+                ? 'bg-emerald-500 animate-pulse'
+                : 'bg-slate-500'
+            }`}
+          />
+          <span className="font-bold text-xs text-slate-100 uppercase tracking-wider">
+            Caméra Live LSF
+          </span>
         </div>
 
         <div className="flex items-center space-x-1.5">
           <button
             type="button"
-            onClick={handleToggleSync}
-            className={`px-2 py-1 rounded text-xs font-semibold flex items-center space-x-1 transition-colors ${
-              isSyncing
-                ? 'bg-sky-500 text-white shadow-xs'
-                : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+            onClick={() => {
+              const next = !isSyncing;
+              setIsSyncing(next);
+              if (!next) onPoseUpdate(null);
+            }}
+            className={`px-2 py-1 rounded text-[10px] font-bold transition-colors flex items-center space-x-1 ${
+              isSyncing ? 'bg-sky-500 text-white' : 'bg-slate-800 text-slate-400'
             }`}
-            title="Activer/Désactiver la synchronisation directe avec le modèle 3D/2D"
+            title="Activer ou suspendre la synchronisation avec l'avatar"
           >
             <Activity className="w-3 h-3" />
-            <span>{isSyncing ? 'Synchro ON' : 'Synchro OFF'}</span>
+            <span>{isSyncing ? 'SYNCHRO ON' : 'SYNCHRO OFF'}</span>
           </button>
 
           <button
             type="button"
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+            className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
             title="Fermer le panneau caméra"
           >
             <X className="w-4 h-4" />
@@ -491,145 +667,153 @@ export const WebcamSplitPanel: React.FC<WebcamSplitPanelProps> = ({
         </div>
       </div>
 
-      {/* Zone vidéo et Canvas d'analyse cinématique */}
-      <div className="relative flex-1 bg-slate-950 overflow-hidden flex items-center justify-center">
-        {/* Élément Video masqué (utilisé pour alimenter MediaPipe) */}
-        <video
-          ref={videoRef}
-          playsInline
-          muted
-          className="hidden"
-          width={640}
-          height={480}
-        />
+      {/* Zone d'affichage vidéo et squelette OpenCV */}
+      <div className="relative flex-1 min-h-0 w-full bg-black overflow-hidden flex items-center justify-center">
+        {/* Conteneur avec effet miroir CSS synchronisé */}
+        <div
+          className={`relative w-full h-full flex items-center justify-center ${
+            isMirrored ? 'scale-x-[-1]' : ''
+          }`}
+        >
+          {/* Vidéo source de capture (décode les trames en continu en arrière-plan) */}
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className="absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none"
+          />
 
-        {/* Canvas de dessin OpenCV Overlay */}
-        <canvas
-          ref={canvasRef}
-          width={640}
-          height={480}
-          className="w-full h-auto object-contain bg-slate-950 aspect-[4/3]"
-        />
+          {/* Canvas principal composite (Affiche directement le flux vidéo webcam + squelette OpenCV) */}
+          <canvas
+            ref={canvasRef}
+            width={640}
+            height={480}
+            className="w-full h-full object-cover"
+          />
+        </div>
 
-        {/* Indicateur de chargement ou Erreur */}
-        {!isCameraActive && !cameraError && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 p-4 text-center space-y-3 z-10">
-            <RefreshCw className="w-8 h-8 text-sky-400 animate-spin" />
-            <p className="text-sm font-medium text-slate-200">Initialisation de la caméra & MediaPipe Hands...</p>
-            <p className="text-xs text-slate-400">Chargement des modèles WASM TensorFlow.js</p>
+        {/* Chargement initial lors de l'accès matériel */}
+        {(isStarting || (!isStreamReady && isCameraActive && !cameraError)) && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 space-y-3 z-10 p-4 text-center">
+            <RefreshCw className="w-7 h-7 text-sky-400 animate-spin" />
+            <p className="text-xs font-semibold text-slate-200">
+              Connexion au flux vidéo caméra...
+            </p>
+            <p className="text-[10px] text-slate-400">Activation du capteur webcam réel</p>
           </div>
         )}
 
-        {cameraError && (
+        {/* État de chargement discret du modèle IA en tâche de fond */}
+        {isCameraActive && isStreamReady && isModelLoading && (
+          <div className="absolute bottom-3 left-3 z-10 bg-slate-950/85 border border-slate-800 px-2 py-1 rounded text-[10px] text-sky-400 flex items-center space-x-1.5">
+            <RefreshCw className="w-3 h-3 animate-spin" />
+            <span>Chargement du modèle MediaPipe Hands...</span>
+          </div>
+        )}
+
+        {/* Gestion des erreurs de permission avec instructions claires */}
+        {cameraError && !isStarting && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/95 p-6 text-center space-y-4 z-10">
-            <AlertCircle className="w-10 h-10 text-rose-500" />
-            <div className="space-y-1">
-              <p className="text-sm font-bold text-rose-300">Accès à la caméra refusé</p>
-              <div className="text-xs text-slate-400 text-left max-w-xs space-y-2 mt-2">
-                <p>Pour autoriser l'accès :</p>
-                <ol className="list-decimal pl-4 space-y-1">
-                  <li>Cliquez sur l'icône <span className="font-bold text-white">Cadenas</span> ou <span className="font-bold text-white">Caméra</span> dans la barre d'adresse.</li>
-                  <li>Cherchez l'option <span className="font-bold text-white">Caméra</span>.</li>
-                  <li>Passez-la sur <span className="font-bold text-white">Autoriser</span>.</li>
-                  <li><span className="font-bold text-white">Actualisez</span> la page (F5).</li>
-                </ol>
-              </div>
+            {isPermissionDenied ? (
+              <Lock className="w-10 h-10 text-amber-400" />
+            ) : (
+              <AlertCircle className="w-10 h-10 text-rose-500" />
+            )}
+            <div className="space-y-1.5">
+              <p
+                className={`text-xs font-bold uppercase tracking-wide ${
+                  isPermissionDenied ? 'text-amber-300' : 'text-rose-300'
+                }`}
+              >
+                {isPermissionDenied ? 'Autorisation caméra requise' : 'Accès caméra indisponible'}
+              </p>
+              <p className="text-xs text-slate-300 max-w-xs">{cameraError}</p>
+
+              {isPermissionDenied && (
+                <div className="text-[11px] text-slate-400 text-left bg-slate-900 p-3 rounded-lg border border-slate-800 space-y-1 mt-3">
+                  <p className="font-semibold text-slate-200">Pour autoriser la caméra :</p>
+                  <ol className="list-decimal pl-4 space-y-1 text-slate-400">
+                    <li>
+                      Cliquez sur le bouton ci-dessous pour déclencher la demande du navigateur.
+                    </li>
+                    <li>
+                      Si bloquée, cliquez sur l’icône de <strong className="text-white">cadenas</strong> dans l’adresse du navigateur et choisissez <strong className="text-emerald-400">Autoriser</strong>.
+                    </li>
+                  </ol>
+                </div>
+              )}
             </div>
-            
+
             <button
               type="button"
               onClick={startCamera}
-              className="px-4 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 text-white text-xs font-semibold transition-colors"
+              className="px-4 py-2.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-white text-xs font-bold transition-all shadow-md shadow-sky-500/20 flex items-center space-x-2"
             >
-              Réessayer après autorisation
+              <CameraIcon className="w-4 h-4" />
+              <span>{isPermissionDenied ? 'Autoriser et activer la caméra' : 'Réessayer d’activer la caméra'}</span>
             </button>
           </div>
         )}
 
-        {/* HUD des métriques OpenCV en superpesanteur haut-gauche */}
-        {isCameraActive && (
-          <div className="absolute top-2 left-2 z-10 bg-slate-900/85 backdrop-blur-xs border border-slate-800 rounded-md p-2 text-xs space-y-1 text-slate-300">
-            <div className="flex items-center space-x-2 font-mono text-[11px]">
-              <span className="text-sky-400 font-bold">OpenCV / MediaPipe</span>
-              <span className="text-slate-500">|</span>
-              <span className="text-emerald-400">{fps} FPS</span>
+        {/* HUD Métriques en haut à gauche */}
+        {isCameraActive && isStreamReady && !cameraError && (
+          <div className="absolute top-3 left-3 z-10 bg-slate-950/80 backdrop-blur-sm border border-slate-800 px-2.5 py-1.5 rounded-lg text-slate-300 space-y-1">
+            <div className="flex items-center space-x-2 text-[10px] font-mono">
+              <span className="text-sky-400 font-bold">{fps} FPS</span>
+              <span className="text-slate-600">|</span>
+              <span className={detectedHands.length > 0 ? 'text-emerald-400 font-bold' : 'text-slate-500'}>
+                {detectedHands.length > 0 ? detectedHands.join(' + ') : 'Aucune main détectée'}
+              </span>
             </div>
-            <div className="flex items-center space-x-1 text-[11px]">
-              <span className="text-slate-400">Mains détectées:</span>
-              <span className="font-bold text-white">{detectedHandCount}</span>
-            </div>
-            {handLabels.length > 0 && (
-              <div className="flex flex-wrap gap-1 pt-0.5">
-                {handLabels.map((lbl, i) => (
-                  <span key={i} className="px-1.5 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-800 text-[10px]">
-                    {lbl}
-                  </span>
-                ))}
-              </div>
-            )}
           </div>
         )}
       </div>
 
-      {/* Barre d'outils et réglages caméra bas de panneau */}
-      <div className="p-3 bg-slate-950 border-t border-slate-800 space-y-2.5">
-        <div className="flex items-center justify-between text-xs text-slate-300">
-          <label className="flex items-center space-x-1.5 cursor-pointer">
+      {/* Barre de contrôles inférieure */}
+      <div className="p-3 bg-slate-950 border-t border-slate-800 space-y-3 shrink-0">
+        <div className="flex items-center justify-between text-xs text-slate-400">
+          <label className="flex items-center space-x-1.5 cursor-pointer hover:text-slate-200 transition-colors">
             <input
               type="checkbox"
               checked={isMirrored}
               onChange={(e) => setIsMirrored(e.target.checked)}
               className="rounded border-slate-700 bg-slate-800 text-sky-500 focus:ring-0"
             />
-            <span>Mode Miroir (Inverser)</span>
+            <FlipHorizontal className="w-3.5 h-3.5" />
+            <span className="text-[11px]">Mode Miroir</span>
           </label>
 
-          <label className="flex items-center space-x-1.5 cursor-pointer">
+          <label className="flex items-center space-x-1.5 cursor-pointer hover:text-slate-200 transition-colors">
             <input
               type="checkbox"
               checked={showMeshOverlay}
               onChange={(e) => setShowMeshOverlay(e.target.checked)}
               className="rounded border-slate-700 bg-slate-800 text-sky-500 focus:ring-0"
             />
-            <span>Superstructure OpenCV</span>
+            <Layers className="w-3.5 h-3.5" />
+            <span className="text-[11px]">Squelette OpenCV</span>
           </label>
         </div>
 
-        {/* Curseur de lissage */}
-        <div className="space-y-1">
-          <div className="flex justify-between text-[11px] text-slate-400">
-            <span>Sensibilité du mouvement</span>
-            <span className="text-sky-400 font-mono">{Math.round(smoothingFactor * 100)}%</span>
-          </div>
-          <input
-            type="range"
-            min="0.1"
-            max="1.0"
-            step="0.05"
-            value={smoothingFactor}
-            onChange={(e) => setSmoothingFactor(parseFloat(e.target.value))}
-            className="w-full accent-sky-500 bg-slate-800 h-1.5 rounded-lg cursor-pointer"
-          />
-        </div>
-
-        {/* Bouton de relancement */}
+        {/* Bouton bascule Activer / Désactiver caméra */}
         <button
           type="button"
           onClick={isCameraActive ? stopCamera : startCamera}
-          className={`w-full py-2 rounded-lg text-xs font-bold flex items-center justify-center space-x-2 transition-colors ${
+          className={`w-full py-2.5 rounded-lg text-xs font-bold flex items-center justify-center space-x-2 transition-all ${
             isCameraActive
-              ? 'bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30'
-              : 'bg-sky-500 hover:bg-sky-400 text-white shadow-md'
+              ? 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 border border-rose-500/30'
+              : 'bg-sky-500 hover:bg-sky-400 text-white shadow-lg shadow-sky-500/20'
           }`}
         >
           {isCameraActive ? (
             <>
-              <VideoOff className="w-3.5 h-3.5" />
+              <VideoOff className="w-4 h-4" />
               <span>Désactiver la caméra</span>
             </>
           ) : (
             <>
-              <CameraIcon className="w-3.5 h-3.5" />
+              <CameraIcon className="w-4 h-4" />
               <span>Activer la caméra</span>
             </>
           )}
